@@ -1,0 +1,29 @@
+[project]
+name = "indig-chat-ai"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "exa-py>=2.27.0",
+    "fastapi>=0.143.5",
+    "google-genai>=2.31.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.1",
+    "pydantic-ai-slim[google]>=2.57.0",
+    "pydantic-settings>=2.16.0",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.33",
+    "redis>=8.1.0",
+    "sse-starlette>=3.5.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
