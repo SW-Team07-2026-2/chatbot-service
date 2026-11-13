@@ -1,0 +1,67 @@
+# 테스트 · ECR push (arm64) · 매니페스트 레포 이미지 태그 커밋. CI 에는 클러스터 권한이 없습니다 — 배포는 ArgoCD 가 매니페스트 레포를 Pull 합니다
+# 키는 deploy 잡만 받습니다. MANIFESTS_DEPLOY_KEY 는 Environment `deploy` (배포 브랜치 main 만) 의 secret — PR 실행(test 잡)에는 없습니다
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run --frozen pytest
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: deploy      # ★ 다른 브랜치에서 이 잡을 고쳐 돌려도 GitHub 이 거절 · OIDC sub 가 environment:deploy 로 바뀜 (Terraform trust)
+    permissions:
+      id-token: write        # AWS OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ECR_PUSH_ROLE_ARN }}   # ecr:push 전용
+          aws-region: ap-northeast-2
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64                    # ★ t4g (Graviton)
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/indig-chatbot:${{ github.sha }}   # ★ 커밋 SHA — latest 금지
+
+      # 매니페스트 레포의 이미지 태그를 고쳐 main 에 직접 커밋 → ArgoCD 가 배포 (main 룰셋 없음 · 쓰기 권한은 이 deploy key 만)
+      - uses: actions/checkout@v4
+        with:
+          repository: SW-Team07-2026-2/manifests
+          ref: main                                        # 기본 브랜치(develop)가 아니라 ArgoCD 가 보는 main 에 커밋
+          ssh-key: ${{ secrets.MANIFESTS_DEPLOY_KEY }}   # 매니페스트 레포 쓰기 전용 — 클러스터 권한은 여전히 0
+          path: manifests
+      - working-directory: manifests
+        env:
+          FILE: services/chatbot/kustomization.yaml
+          IMAGE: ${{ steps.ecr.outputs.registry }}/indig-chatbot
+          TAG: ${{ github.sha }}
+        run: |
+          sed -i -E "s|^([[:space:]]*newName:).*|\1 ${IMAGE}|; s|^([[:space:]]*newTag:).*|\1 \"${TAG}\"|" "$FILE"
+          git diff --quiet && exit 0                   # 같은 커밋 재실행 — 바뀐 게 없음
+          git config user.name "indie-ci"
+          git config user.email "indie-ci@users.noreply.github.com"
+          git commit -qam "deploy(chatbot): ${TAG::7}"
+          for i in 1 2 3; do                           # 다른 서비스 CI 와 동시에 push 하면 거절 → rebase 후 재시도
+            git pull -q --rebase && git push -q && exit 0
+            sleep $((RANDOM % 5 + 1))
+          done
+          exit 1
