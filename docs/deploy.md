@@ -36,7 +36,7 @@ Gateway 를 지날 때 지켜야 하는 것:
 
 ## 3. 배포 흐름
 
-1. 작업 브랜치 → `develop` PR (테스트만 돕니다)
+1. 작업 브랜치 → `develop` PR (앱 기동 확인만 돕니다 — `import gateway_entry`)
 2. `develop` → `main` 머지 → CI 가 arm64 이미지를 ECR `indig-chatbot:<커밋 SHA>` 로 올리고, manifests 레포의 이미지 태그를 고쳐 커밋합니다
 3. ArgoCD 가 manifests `main` 을 읽어 클러스터에 반영합니다
 

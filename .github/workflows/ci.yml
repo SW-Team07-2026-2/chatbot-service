@@ -15,7 +15,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --frozen
-      - run: uv run --frozen pytest
+      # 테스트 파일은 없습니다 — 앱이 import 되는지(의존성 · 설정 · 라우터 등록)만 확인합니다. 값은 확인용 가짜
+      - run: uv run --frozen python -c "import gateway_entry"
+        env:
+          ENVIRONMENT: prod
+          REDIS_URL: redis://localhost:6379/0
+          CORS_ORIGINS: http://localhost
+          BACKEND_URL: http://localhost
+          LLM_MODEL: test
+          GEMINI_API_KEY: test
+          EXA_API_KEY: test
 
   deploy:
     needs: test
