@@ -1,4 +1,4 @@
-# 테스트 · ECR push (amd64 · arm64) · 매니페스트 레포 이미지 태그 커밋. CI 에는 클러스터 권한이 없습니다 — 배포는 ArgoCD 가 매니페스트 레포를 Pull 합니다
+# 테스트 · ECR · Docker Hub push (amd64 · arm64) · 매니페스트 레포 이미지 태그 커밋. CI 에는 클러스터 권한이 없습니다 — 배포는 ArgoCD 가 매니페스트 레포를 Pull 합니다
 # 키는 deploy 잡만 받습니다. MANIFESTS_DEPLOY_KEY 는 Environment `deploy` (배포 브랜치 main 만) 의 secret — PR 실행(test 잡)에는 없습니다
 name: ci
 on:
@@ -42,6 +42,10 @@ jobs:
           aws-region: ap-northeast-2
       - id: ecr
         uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/login-action@v3          # Docker Hub — 온프레미스(실습실 PC)는 여기서 익명으로 받습니다 (AWS 는 그대로 ECR)
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}     # Environment `deploy` 의 변수
+          password: ${{ secrets.DOCKERHUB_TOKEN }}     # Environment `deploy` 의 secret (push 토큰)
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
@@ -49,7 +53,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64        # ★ arm64 = AWS t4g (Graviton) · amd64 = 온프레미스 PC
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/indig-chatbot:${{ github.sha }}   # ★ 커밋 SHA — latest 금지
+          tags: |                                  # ★ 커밋 SHA — latest 금지 · 같은 이미지를 두 곳에 올립니다
+            ${{ steps.ecr.outputs.registry }}/indig-chatbot:${{ github.sha }}
+            ${{ vars.DOCKERHUB_USERNAME }}/indig-chatbot:${{ github.sha }}
 
       # 매니페스트 레포의 이미지 태그를 고쳐 main 에 직접 커밋 → ArgoCD 가 배포 (main 룰셋 없음 · 쓰기 권한은 이 deploy key 만)
       - uses: actions/checkout@v4
