@@ -324,3 +324,44 @@ def test_recommender_admin_endpoints_and_secret_guard(monkeypatch):
         assert wb.status_code == 200
         assert wb.json()["ok"] is True
 
+
+async def test_redis_snapshot_roundtrip_and_multi_pod_version_sync(_setup_recommender_env):
+    """Pod A가 Redis에 스냅샷을 올리면 Pod B가 버전 변화 감지로 즉시 핫 리로드해야 함"""
+    _, demo_idx = _setup_recommender_env
+    b64 = demo_idx.to_snapshot_b64()
+    new_ver = await store.save_index_snapshot(b64)
+    assert new_ver == 1
+
+    # 새로운 빈 Pod B의 ItemIndex 시뮬레이션
+    pod_b_idx = index.ItemIndex()
+    assert pod_b_idx.is_ready is False
+
+    snap = await store.load_index_snapshot()
+    assert snap is not None
+    ver, loaded_b64 = snap
+    assert pod_b_idx.load_from_snapshot_b64(loaded_b64, version=ver) is True
+    assert pod_b_idx.item_count == demo_idx.item_count
+    assert pod_b_idx.version == 1
+
+
+def test_v2_chip_filters_on_popular_and_personalized():
+    with TestClient(app) as client:
+        # 장르 칩 필터 (JAZZ만)
+        res = client.get("/api/recommender/popular/artists?genre=JAZZ")
+        assert res.status_code == 200
+        ids = [it["item_id"] for it in res.json()["items"]]
+        assert ids == [2]
+
+        # 공연 지역 칩 필터 (SEOUL만)
+        res_c = client.get(
+            "/api/recommender/concerts?region=SEOUL",
+            headers={"X-User-Id": "u-filter"},
+        )
+        assert res_c.status_code == 200
+        assert [it["item_id"] for it in res_c.json()["items"]] == [201]
+
+        # 잘못된 가격 범위 -> 400
+        bad = client.get("/api/recommender/popular/goods?minPrice=50000&maxPrice=10000")
+        assert bad.status_code == 400
+
+

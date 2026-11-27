@@ -77,6 +77,7 @@ class ItemRecord(BaseModel):
     released_at: str | None = None
     popularity_prior: float = 0.0
     text_doc: str = ""
+    embed_hash: str = ""
     payload: dict[str, Any] = Field(
         default_factory=dict,
         description="프론트 목록 카드 호환 원본 항목(ArtistItem, ConcertSummary 등)",

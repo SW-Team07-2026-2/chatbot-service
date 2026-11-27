@@ -3,7 +3,9 @@ from fastapi.testclient import TestClient
 
 from app.chatbot import api as chatbot_api
 from app.chatbot import history
+from app.config import constant
 from app.main import app
+from app.recommender import store as rec_store
 from app.server import api as server_api
 from app.server import redis as server_redis
 from tests.conftest import FakeRedis
@@ -11,6 +13,8 @@ from tests.conftest import FakeRedis
 
 @pytest.fixture(autouse=True)
 def _mock_lifespan_redis(monkeypatch):
+    fake_redis = FakeRedis()
+
     async def noop_ping():
         return True
 
@@ -19,6 +23,8 @@ def _mock_lifespan_redis(monkeypatch):
 
     monkeypatch.setattr(server_redis, "ping", noop_ping)
     monkeypatch.setattr(server_redis, "close", noop_close)
+    monkeypatch.setattr(rec_store, "get_client", lambda: fake_redis)
+    monkeypatch.setattr(constant, "REC_AUTO_SYNC_ON_STARTUP", False)
 
 
 def test_health_endpoints(monkeypatch):

@@ -1,7 +1,10 @@
 """NumPy 기반 이중 벡터 인덱스(추천 128d + 시맨틱 텍스트 768d) 및 메타데이터 레지스트리."""
 
+import base64
+import io
 import json
 from pathlib import Path
+import zlib
 
 import numpy as np
 
@@ -17,6 +20,7 @@ class ItemIndex:
 
     def __init__(self) -> None:
         self._ready: bool = False
+        self._version: int = 0
         self._keys: list[str] = []
         self._key_to_pos: dict[str, int] = {}
         self._metadata: dict[str, ItemRecord] = {}
@@ -27,6 +31,13 @@ class ItemIndex:
     @property
     def is_ready(self) -> bool:
         return self._ready and len(self._keys) > 0
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def set_version(self, version: int) -> None:
+        self._version = int(version)
 
     @property
     def item_count(self) -> int:
@@ -154,6 +165,51 @@ class ItemIndex:
             return True
         except Exception as e:
             logger.error(f"Recommender 인덱스 로드 실패 ({artifact_dir}): {e}")
+            return False
+
+    def to_snapshot_b64(self) -> str:
+        """K8s 멀티 Pod 공유용 Redis 스냅샷 직렬화 (zlib 압축 + base64)"""
+        buf = io.BytesIO()
+        arrays: dict[str, np.ndarray] = {
+            "text_matrix": self._text_matrix,
+            "rec_matrix": self._rec_matrix,
+        }
+        if self._projector:
+            for k, v in self._projector.items():
+                arrays[f"proj_{k}"] = np.asarray(v, dtype=np.float32)
+        np.savez_compressed(buf, **arrays)
+
+        envelope = {
+            "items": [self._metadata[k].model_dump() for k in self._keys],
+            "npz_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+        }
+        compressed = zlib.compress(json.dumps(envelope, ensure_ascii=False).encode("utf-8"), level=6)
+        return base64.b64encode(compressed).decode("ascii")
+
+    def load_from_snapshot_b64(self, snapshot_b64: str, *, version: int = 0) -> bool:
+        """Redis 공유 스냅샷에서 이중 인덱스 복원"""
+        try:
+            raw = zlib.decompress(base64.b64decode(snapshot_b64.encode("ascii")))
+            envelope = json.loads(raw.decode("utf-8"))
+            records = [ItemRecord(**item) for item in envelope.get("items", [])]
+            npz_bytes = base64.b64decode(envelope["npz_b64"].encode("ascii"))
+            npz = np.load(io.BytesIO(npz_bytes))
+            text_mat = npz["text_matrix"]
+            rec_mat = npz["rec_matrix"]
+            projector = {
+                k.removeprefix("proj_"): npz[k]
+                for k in npz.files
+                if k.startswith("proj_")
+            } or None
+            self.build(records, text_mat, rec_mat, projector=projector)
+            if version > 0:
+                self._version = int(version)
+            logger.info(
+                f"Recommender Redis 스냅샷 로드 완료: {self.item_count}건 (v{self._version})"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Recommender Redis 스냅샷 로드 실패: {e}")
             return False
 
     def _search_matrix(

@@ -75,6 +75,11 @@ class FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.kv.get(key)
 
+    async def incr(self, key: str) -> int:
+        val = int(self.kv.get(key, "0")) + 1
+        self.kv[key] = str(val)
+        return val
+
     async def sadd(self, key: str, *values: str) -> int:
         bucket = self.sets.setdefault(key, set())
         before = len(bucket)

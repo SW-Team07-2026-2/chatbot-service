@@ -1,19 +1,28 @@
 """백엔드 공개 v2 API에서 아티스트·앨범/트랙·피지컬·굿즈·공연을 수집해 이중 인덱스를 동기화."""
 
 import asyncio
+import hashlib
 from typing import Any
+
+import numpy as np
 
 from app.config import constant, logger, setting
 from app.server.http import get_backend_client
+from . import store
 from .embedding import (
     build_artist_doc,
     build_concert_doc,
     build_goods_doc,
     build_physical_album_doc,
     embed_texts,
+    project_text_to_rec,
 )
 from .index import get_item_index
 from .schemas import ItemRecord, TargetType
+
+
+def compute_embed_hash(text_doc: str) -> str:
+    return hashlib.sha256(text_doc.strip().encode("utf-8")).hexdigest()[:16]
 
 __all__ = [
     "fetch_all_catalog_records",
@@ -210,20 +219,70 @@ async def fetch_all_catalog_records() -> list[ItemRecord]:
 
 
 async def sync_catalog_to_index(*, save_artifact: bool = True) -> int:
-    """백엔드 카탈로그를 수집해 텍스트 임베딩 생성 후 ItemIndex 갱신"""
+    """백엔드 카탈로그를 수집해 embed_hash 증분 임베딩 후 ItemIndex 및 Redis 스냅샷 갱신"""
     records = await fetch_all_catalog_records()
     if not records:
         logger.warning("[카탈로그 동기화] 수집된 아이템이 0건입니다.")
         return 0
 
-    docs = [r.text_doc for r in records]
-    text_vectors = await embed_texts(docs, task_type="RETRIEVAL_DOCUMENT")
+    for r in records:
+        if not r.embed_hash:
+            r.embed_hash = compute_embed_hash(r.text_doc)
 
     idx = get_item_index()
-    idx.build(records, text_vectors, projector=idx._projector)
+    reused_text: dict[int, np.ndarray] = {}
+    reused_rec: dict[int, np.ndarray] = {}
+    to_embed_indices: list[int] = []
+    to_embed_docs: list[str] = []
+
+    for i, r in enumerate(records):
+        old_meta = idx.get_item_meta(r.item_key)
+        old_t = idx.get_text_vector(r.item_key)
+        old_r = idx.get_rec_vector(r.item_key)
+        if old_meta is not None and old_meta.embed_hash == r.embed_hash and old_t is not None:
+            reused_text[i] = old_t
+            if old_r is not None:
+                reused_rec[i] = old_r
+        else:
+            to_embed_indices.append(i)
+            to_embed_docs.append(r.text_doc)
+
+    new_text_vecs = (
+        await embed_texts(to_embed_docs, task_type="RETRIEVAL_DOCUMENT")
+        if to_embed_docs
+        else np.zeros((0, constant.REC_TEXT_EMBED_DIM), dtype=np.float32)
+    )
+
+    text_dim = (
+        new_text_vecs.shape[1]
+        if len(new_text_vecs) > 0
+        else (next(iter(reused_text.values())).shape[0] if reused_text else constant.REC_TEXT_EMBED_DIM)
+    )
+    final_text = np.zeros((len(records), text_dim), dtype=np.float32)
+    final_rec = np.zeros((len(records), constant.REC_EMBED_DIM), dtype=np.float32)
+
+    for i, vec in reused_text.items():
+        final_text[i] = vec
+        final_rec[i] = (
+            reused_rec[i]
+            if i in reused_rec
+            else project_text_to_rec(vec, idx._projector)
+        )
+    for pos, orig_i in enumerate(to_embed_indices):
+        t_vec = new_text_vecs[pos]
+        final_text[orig_i] = t_vec
+        final_rec[orig_i] = project_text_to_rec(t_vec, idx._projector)
+
+    idx.build(records, final_text, final_rec, projector=idx._projector)
     if save_artifact:
         idx.save(setting.REC_ARTIFACT_DIR)
-    logger.info(f"[카탈로그 동기화 완료] 총 {len(records)}건 인덱싱")
+        new_ver = await store.save_index_snapshot(idx.to_snapshot_b64())
+        if new_ver > 0:
+            idx.set_version(new_ver)
+
+    logger.info(
+        f"[카탈로그 증분 동기화 완료] 총 {len(records)}건 (신규/변경 임베딩 {len(to_embed_indices)}건, 재사용 {len(reused_text)}건, v{idx.version})"
+    )
     return len(records)
 
 
@@ -317,11 +376,15 @@ async def upsert_single_item_from_backend(
     if record is None:
         return None
 
+    record.embed_hash = compute_embed_hash(record.text_doc)
     text_vecs = await embed_texts([record.text_doc], task_type="RETRIEVAL_DOCUMENT", batch_size=1)
     idx = get_item_index()
     idx.upsert_item(record, text_vecs[0])
     if save_artifact:
         idx.save(setting.REC_ARTIFACT_DIR)
-    logger.info(f"[단일 아이템 즉시 반영 완료] {record.item_key}")
+        new_ver = await store.save_index_snapshot(idx.to_snapshot_b64())
+        if new_ver > 0:
+            idx.set_version(new_ver)
+    logger.info(f"[단일 아이템 즉시 반영 완료] {record.item_key} (v{idx.version})")
     return record
 

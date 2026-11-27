@@ -15,6 +15,8 @@ __all__ = [
     "make_popular_cache_key",
     "make_fandom_trend_key",
     "make_global_trend_key",
+    "make_index_snapshot_key",
+    "make_index_version_key",
     "get_user_taste",
     "save_user_taste",
     "pop_dirty_users",
@@ -28,6 +30,9 @@ __all__ = [
     "record_trend_event",
     "get_fandom_trends",
     "get_global_trends",
+    "save_index_snapshot",
+    "get_index_version",
+    "load_index_snapshot",
 ]
 
 ALL_CATEGORIES: tuple[RecommendCategory, ...] = (
@@ -64,6 +69,14 @@ def make_fandom_trend_key(artist_id: int) -> str:
 
 def make_global_trend_key(category: RecommendCategory) -> str:
     return f"rec:trend:global:{category}"
+
+
+def make_index_snapshot_key() -> str:
+    return "rec:index:snapshot"
+
+
+def make_index_version_key() -> str:
+    return "rec:index:version"
 
 
 async def get_user_taste(user_uuid: str) -> UserTasteState | None:
@@ -249,3 +262,39 @@ async def get_global_trends(category: RecommendCategory, top_k: int = 30) -> dic
         return {str(k): float(s) for k, s in sorted_pairs}
     except Exception:
         return {}
+
+
+async def save_index_snapshot(snapshot_b64: str) -> int:
+    """K8s 멀티 Pod 공유용 인덱스 스냅샷을 Redis에 저장하고 버전을 1 증가"""
+    try:
+        r = get_client()
+        await r.set(make_index_snapshot_key(), snapshot_b64)
+        new_version = int(await r.incr(make_index_version_key()))
+        return new_version
+    except Exception as e:
+        logger.warning(f"[인덱스 스냅샷 Redis 저장 실패]: {e}")
+        return 0
+
+
+async def get_index_version() -> int:
+    """Redis에 올라간 최신 인덱스 버전 번호 조회"""
+    try:
+        raw = await get_client().get(make_index_version_key())
+        return int(raw) if raw else 0
+    except Exception:
+        return 0
+
+
+async def load_index_snapshot() -> tuple[int, str] | None:
+    """Redis에서 최신 인덱스 스냅샷과 버전 조회"""
+    try:
+        r = get_client()
+        snapshot = await r.get(make_index_snapshot_key())
+        if not snapshot:
+            return None
+        ver_raw = await r.get(make_index_version_key())
+        version = int(ver_raw) if ver_raw else 1
+        return version, str(snapshot)
+    except Exception as e:
+        logger.warning(f"[인덱스 스냅샷 Redis 조회 실패]: {e}")
+        return None

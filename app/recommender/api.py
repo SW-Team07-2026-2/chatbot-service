@@ -117,14 +117,64 @@ async def admin_clear_cache():
     return {"ok": True}
 
 
-@router.get("/popular/{category}", response_model=RecommendationPage)
+def _parse_csv_list(values: list[str] | None) -> list[str]:
+    """v2 칩 파라미터 파싱: ?genre=EMO,SHOEGAZE 또는 ?genre=EMO&genre=SHOEGAZE 모두 지원"""
+    if not values:
+        return []
+    out: list[str] = []
+    for raw in values:
+        for part in str(raw).split(","):
+            token = part.strip().upper()
+            if token and token not in out:
+                out.append(token)
+    return out
+
+
+def _extract_v2_filters(
+    genre: list[str] | None = Query(default=None),
+    gender: list[str] | None = Query(default=None),
+    composition: list[str] | None = Query(default=None),
+    format: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    minPrice: int | None = Query(default=None, ge=0),
+    maxPrice: int | None = Query(default=None, ge=0),
+    excludeSoldOut: bool | None = Query(default=None),
+    saleStatus: list[str] | None = Query(default=None),
+    type: list[str] | None = Query(default=None),
+    region: list[str] | None = Query(default=None),
+) -> dict:
+    if minPrice is not None and maxPrice is not None and maxPrice < 150_000 and minPrice > maxPrice:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="minPrice는 maxPrice보다 클 수 없습니다.",
+        )
+    return {
+        "genre": _parse_csv_list(genre),
+        "gender": _parse_csv_list(gender),
+        "composition": _parse_csv_list(composition),
+        "format": _parse_csv_list(format),
+        "category": _parse_csv_list(category),
+        "minPrice": minPrice,
+        "maxPrice": maxPrice,
+        "excludeSoldOut": excludeSoldOut,
+        "saleStatus": _parse_csv_list(saleStatus),
+        "type": _parse_csv_list(type),
+        "region": _parse_csv_list(region),
+    }
+
+
+V2Filters = Annotated[dict, Depends(_extract_v2_filters)]
+
+
+@router.get("/popular/{tab}", response_model=RecommendationPage)
 async def get_popular_items(
-    category: RecommendCategory,
+    tab: RecommendCategory,
+    filters: V2Filters,
     page: int = Query(default=0, ge=0),
     size: int = Query(default=20, ge=1, le=50),
 ):
-    """카테고리별 전체 인기 목록 조회 (공개)"""
-    return await service.get_popular(category=category, page=page, size=size)
+    """카테고리별 전체 인기 목록 조회 (공개 · v2 칩 필터 지원)"""
+    return await service.get_popular(category=tab, page=page, size=size, filters=filters)
 
 
 @router.get("/similar/{target_type}/{item_id}", response_model=RecommendationPage)
@@ -184,17 +234,19 @@ async def submit_feedback(payload: FeedbackRequest, user_uuid: UserUUID):
     return {"ok": True}
 
 
-@router.get("/{category}", response_model=RecommendationPage)
+@router.get("/{tab}", response_model=RecommendationPage)
 async def get_recommended_items(
-    category: RecommendCategory,
+    tab: RecommendCategory,
     user_uuid: UserUUID,
+    filters: V2Filters,
     page: int = Query(default=0, ge=0),
     size: int = Query(default=20, ge=1, le=50),
 ):
-    """카테고리별 개인화 전체 추천 목록 조회 (로그인 필요)"""
+    """카테고리별 개인화 전체 추천 목록 조회 (로그인 필요 · v2 칩 필터 지원)"""
     return await service.get_recommendations(
-        category=category,
+        category=tab,
         user_uuid=user_uuid,
         page=page,
         size=size,
+        filters=filters,
     )

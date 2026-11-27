@@ -93,6 +93,27 @@ CACHE_INVALIDATING_METRICS: set[str] = {
 _scheduler_tasks: list[asyncio.Task] = []
 _last_synced_at: float | None = None
 _last_writeback_at: float | None = None
+_last_version_check_at: float = 0.0
+_VERSION_CHECK_INTERVAL_SECONDS: float = 5.0
+
+
+async def ensure_latest_index(*, force: bool = False) -> None:
+    """K8s 멀티 Pod 환경에서 Redis 중앙 스냅샷 버전이 올라갔으면 즉시 로컬 메모리를 핫 리로드"""
+    global _last_version_check_at
+    now = time.time()
+    if not force and (now - _last_version_check_at) < _VERSION_CHECK_INTERVAL_SECONDS:
+        return
+    _last_version_check_at = now
+
+    idx = get_item_index()
+    remote_ver = await store.get_index_version()
+    if remote_ver <= 0 or remote_ver <= idx.version:
+        return
+
+    snap = await store.load_index_snapshot()
+    if snap is not None:
+        ver, b64 = snap
+        await asyncio.to_thread(idx.load_from_snapshot_b64, b64, version=ver)
 
 
 async def _writeback_loop() -> None:
@@ -130,14 +151,23 @@ async def _catalog_sync_loop(*, run_immediately: bool = False) -> None:
 
 
 async def startup() -> None:
-    """서버 시작 시 디스크 아티팩트 로드 및 백그라운드 동기화/Write-Back 루프 시작"""
+    """서버 시작 시 Redis 중앙 스냅샷(1순위) -> 디스크 아티팩트(2순위) 로드 후 루프 시작"""
     idx = get_item_index()
-    loaded = idx.load(setting.REC_ARTIFACT_DIR)
+    loaded = False
+
+    snap = await store.load_index_snapshot()
+    if snap is not None:
+        ver, b64 = snap
+        loaded = await asyncio.to_thread(idx.load_from_snapshot_b64, b64, version=ver)
+
+    if not loaded:
+        loaded = idx.load(setting.REC_ARTIFACT_DIR)
+
     if loaded:
-        logger.info(f"Recommender 준비 완료 ({idx.item_count}건)")
+        logger.info(f"Recommender 준비 완료 ({idx.item_count}건, v{idx.version})")
     else:
         logger.info(
-            f"Recommender 아티팩트 없음 ({setting.REC_ARTIFACT_DIR}) — 백그라운드 초기 동기화 대기"
+            f"Recommender 스냅샷/아티팩트 없음 ({setting.REC_ARTIFACT_DIR}) — 백그라운드 초기 동기화 대기"
         )
 
     if not _scheduler_tasks:
@@ -175,6 +205,7 @@ def get_status() -> dict[str, Any]:
         "status": "READY" if idx.is_ready else "NOT_READY",
         "index_ready": idx.is_ready,
         "item_count": idx.item_count,
+        "index_version": idx.version,
         "ingest_configured": ingest_client.is_ingest_configured(),
     }
 
@@ -334,56 +365,165 @@ def _pick_reason(
     return best[0], best[2]  # type: ignore[return-value]
 
 
+def _has_active_filters(filters: dict[str, Any] | None) -> bool:
+    if not filters:
+        return False
+    return any(v is not None and v != [] and v != "" for v in filters.values())
+
+
+def matches_filters(rec: ItemRecord, filters: dict[str, Any] | None) -> bool:
+    """v2 API 명세서 0-7과 동일한 칩 필터 규칙 적용 (같은 칩 OR, 다른 칩 AND)"""
+    if not filters:
+        return rec.is_active
+
+    payload = rec.payload or {}
+
+    # 품절 / 마감 기본 처리
+    exclude_sold_out = filters.get("excludeSoldOut")
+    sale_statuses: list[str] = filters.get("saleStatus") or []
+    if rec.target_type in ("PHYSICAL_ALBUM", "GOODS"):
+        is_sold_out = bool(payload.get("soldOut", not rec.is_active))
+        if exclude_sold_out is True and is_sold_out:
+            return False
+    elif rec.target_type == "CONCERT":
+        status_val = str(payload.get("saleStatus") or ("ON_SALE" if rec.is_active else "CLOSED")).upper()
+        if sale_statuses:
+            if status_val not in sale_statuses:
+                return False
+        elif not rec.is_active or status_val == "CLOSED":
+            return False
+    elif not rec.is_active:
+        return False
+
+    # 장르 (공연/아티스트 공통: 같은 칩 OR)
+    genres_filter: list[str] = filters.get("genre") or []
+    if genres_filter:
+        rec_genres = {str(g).upper() for g in (rec.genres or payload.get("genres") or [])}
+        if not (rec_genres & set(genres_filter)):
+            return False
+
+    # 아티스트 성별 / 구성
+    genders_filter: list[str] = filters.get("gender") or []
+    if genders_filter:
+        val = str(payload.get("gender") or "").upper()
+        if val not in genders_filter:
+            return False
+
+    comp_filter: list[str] = filters.get("composition") or []
+    if comp_filter:
+        val = str(payload.get("composition") or "").upper()
+        if val not in comp_filter:
+            return False
+
+    # 피지컬 앨범 형태 (LP | CD | CASSETTE)
+    format_filter: list[str] = filters.get("format") or []
+    if format_filter:
+        val = str(payload.get("format") or "").upper()
+        if val not in format_filter:
+            return False
+
+    # 굿즈 카테고리 (TSHIRT | HAT | ...)
+    goods_cat_filter: list[str] = filters.get("category") or []
+    if goods_cat_filter:
+        val = str(payload.get("category") or "").upper()
+        if val not in goods_cat_filter:
+            return False
+
+    # 가격대 (minPrice / maxPrice; maxPrice >= 150000 이면 상한 없음)
+    min_price = filters.get("minPrice")
+    max_price = filters.get("maxPrice")
+    if min_price is not None or (max_price is not None and max_price < 150_000):
+        item_price = payload.get("minPrice")
+        if item_price is None:
+            item_price = payload.get("price")
+        if item_price is None:
+            return False
+        price_num = int(item_price)
+        if min_price is not None and price_num < int(min_price):
+            return False
+        if max_price is not None and int(max_price) < 150_000 and price_num > int(max_price):
+            return False
+
+    # 공연 유형 (SOLO | FESTIVAL)
+    type_filter: list[str] = filters.get("type") or []
+    if type_filter:
+        val = str(payload.get("type") or "").upper()
+        if val not in type_filter:
+            return False
+
+    # 공연 지역 (17개 Region)
+    region_filter: list[str] = filters.get("region") or []
+    if region_filter:
+        venue = payload.get("venue") or {}
+        val = str(rec.region or venue.get("region") or "").upper()
+        if val not in region_filter:
+            return False
+
+    return True
+
+
 def _score_personalized_candidates(
     idx: ItemIndex,
     category: RecommendCategory,
     state: UserTasteState,
     fandom_trends: dict[str, float],
     global_trends: dict[str, float],
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """CPU-bound 후보군 추출 + 리랭킹 (asyncio.to_thread로 호출)"""
+    """CPU-bound 후보군 추출 + v2 칩 필터 + 리랭킹 (asyncio.to_thread로 호출)"""
     target_type: TargetType = CATEGORY_TO_TARGET_TYPE[category]  # type: ignore[assignment]
     now_ts = time.time()
     disliked = set(state.disliked_items)
     purchased = set(state.purchased_items)
     seen_fresh = set(state.seen_fresh_items)
+    has_filters = _has_active_filters(filters)
 
     candidate_keys: set[str] = set()
     taste_scores: dict[str, float] = {}
 
-    # 1. 유저 벡터 기반 Top-50
-    if state.vector and len(state.vector) == constant.REC_EMBED_DIM:
-        for key, sim in idx.search(
-            state.vector,
-            target_type=target_type,
-            top_k=constant.REC_CANDIDATE_POOL_SIZE,
-            exclude_keys=disliked,
-            active_only=True,
-        ):
-            candidate_keys.add(key)
-            taste_scores[key] = sim
-
-    # 2. 크로스 카테고리 전이: 상위 artist_affinity Top-5 아티스트의 해당 카테고리 아이템
-    top_artists = sorted(
-        ((int(aid), val) for aid, val in state.artist_affinity.items() if val > 0),
-        key=lambda kv: kv[1],
-        reverse=True,
-    )[:5]
-    for aid, _ in top_artists:
-        for rec in idx.get_items_by_artist(aid, target_types={target_type}, active_only=True):
-            if rec.item_key not in disliked:
+    # 필터가 있는 경우 조건에 맞는 전체 대상에서 스코어링 (필터 결과 누락 방지)
+    if has_filters:
+        for rec in idx.all_records:
+            if (
+                rec.target_type == target_type
+                and rec.item_key not in disliked
+                and matches_filters(rec, filters)
+            ):
                 candidate_keys.add(rec.item_key)
+    else:
+        # 1. 유저 벡터 기반 Top-50
+        if state.vector and len(state.vector) == constant.REC_EMBED_DIM:
+            for key, sim in idx.search(
+                state.vector,
+                target_type=target_type,
+                top_k=constant.REC_CANDIDATE_POOL_SIZE,
+                exclude_keys=disliked,
+                active_only=True,
+            ):
+                candidate_keys.add(key)
+                taste_scores[key] = sim
 
-    # 3. 팬덤 실시간 트렌드 + 글로벌 급상승 + 신규 발매 보강
-    for key in list(fandom_trends.keys())[:15] + list(global_trends.keys())[:15]:
-        rec = idx.get_item_meta(key)
-        if rec and rec.is_active and rec.target_type == target_type and key not in disliked:
-            candidate_keys.add(key)
+        # 2. 크로스 카테고리 전이: 상위 artist_affinity Top-5 아티스트의 해당 카테고리 아이템
+        top_artists = sorted(
+            ((int(aid), val) for aid, val in state.artist_affinity.items() if val > 0),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:5]
+        for aid, _ in top_artists:
+            for rec in idx.get_items_by_artist(aid, target_types={target_type}, active_only=True):
+                if rec.item_key not in disliked:
+                    candidate_keys.add(rec.item_key)
 
-    for rec in idx.all_records:
-        if rec.is_active and rec.target_type == target_type and rec.item_key not in disliked:
-            if _is_fresh(rec.released_at, now_ts) or len(candidate_keys) < constant.REC_CANDIDATE_POOL_SIZE:
-                candidate_keys.add(rec.item_key)
+        # 3. 팬덤 실시간 트렌드 + 글로벌 급상승 + 신규 발매 보강
+        for key in list(fandom_trends.keys())[:15] + list(global_trends.keys())[:15]:
+            rec = idx.get_item_meta(key)
+            if rec and rec.is_active and rec.target_type == target_type and key not in disliked:
+                candidate_keys.add(key)
+
+        for rec in idx.all_records:
+            if rec.is_active and rec.target_type == target_type and rec.item_key not in disliked:
+                if _is_fresh(rec.released_at, now_ts) or len(candidate_keys) < constant.REC_CANDIDATE_POOL_SIZE:
+                    candidate_keys.add(rec.item_key)
 
     if not candidate_keys:
         return []
@@ -400,7 +540,9 @@ def _score_personalized_candidates(
     scored: list[dict[str, Any]] = []
     for key in candidate_keys:
         rec = idx.get_item_meta(key)
-        if rec is None or not rec.is_active or key in disliked:
+        if rec is None or key in disliked:
+            continue
+        if not has_filters and not rec.is_active:
             continue
         # 이미 예매 완료한 공연은 제외 (같은 아티스트의 다른 굿즈/LP는 유지)
         if rec.target_type == "CONCERT" and key in purchased:
@@ -550,18 +692,22 @@ async def get_recommendations(
     size: int = 20,
     filters: dict[str, Any] | None = None,
 ) -> RecommendationPage:
-    """개인화 전체 추천 (F5 캐싱 + Cache Stampede 락 + 리랭킹 + Diversity Cap)"""
+    """개인화 전체 추천 (멀티 Pod 버전 동기화 + v2 칩 필터 + F5 캐싱 + 리랭킹)"""
+    await ensure_latest_index()
     idx = get_item_index()
     if not idx.is_ready:
         return RecommendationPage(items=[], page=page, size=size, hasNext=False, degraded=True)
 
     state = await _load_or_init_user_taste(user_uuid)
     sticky_keys = {k for k, cnt in state.revisit_counts.items() if cnt >= 1}
+    has_filters = _has_active_filters(filters)
 
-    pool = await store.get_cached_candidates(user_uuid, category)
+    pool = None if has_filters else await store.get_cached_candidates(user_uuid, category)
     if pool is None:
-        lock_acquired = await store.acquire_candidate_lock(user_uuid, category)
-        if not lock_acquired:
+        lock_acquired = (
+            False if has_filters else await store.acquire_candidate_lock(user_uuid, category)
+        )
+        if not has_filters and not lock_acquired:
             for _ in range(3):
                 await asyncio.sleep(0.08)
                 pool = await store.get_cached_candidates(user_uuid, category)
@@ -591,8 +737,10 @@ async def get_recommendations(
                     state,
                     merged_fandom,
                     global_trends,
+                    filters,
                 )
-                await store.cache_candidates(user_uuid, category, pool)
+                if not has_filters:
+                    await store.cache_candidates(user_uuid, category, pool)
             finally:
                 if lock_acquired:
                     await store.release_candidate_lock(user_uuid, category)
@@ -636,12 +784,14 @@ async def get_popular(
     size: int = 20,
     filters: dict[str, Any] | None = None,
 ) -> RecommendationPage:
-    """비로그인 공개 전체 인기 목록 (실시간 트렌드 + 기본 인기도 + 신선도)"""
+    """비로그인 공개 전체 인기 목록 (멀티 Pod 버전 동기화 + v2 칩 필터 + 실시간 트렌드)"""
+    await ensure_latest_index()
     idx = get_item_index()
     if not idx.is_ready:
         return RecommendationPage(items=[], page=page, size=size, hasNext=False, degraded=True)
 
-    cached = await store.get_cached_popular(category)
+    has_filters = _has_active_filters(filters)
+    cached = None if has_filters else await store.get_cached_popular(category)
     if cached is None:
         target_type: TargetType = CATEGORY_TO_TARGET_TYPE[category]  # type: ignore[assignment]
         global_trends = await store.get_global_trends(category, top_k=100)
@@ -649,7 +799,7 @@ async def get_popular(
 
         recs = [
             r for r in idx.all_records
-            if r.is_active and r.target_type == target_type
+            if r.target_type == target_type and matches_filters(r, filters)
         ]
         max_trend = max((v for v in global_trends.values() if v > 0), default=1.0)
         max_prior = max((r.popularity_prior for r in recs if r.popularity_prior > 0), default=1.0)
@@ -674,7 +824,8 @@ async def get_popular(
             )
         scored.sort(key=lambda x: x["score"], reverse=True)
         cached = _apply_diversity_cap(scored, sticky_keys=set(), limit=100)
-        await store.cache_popular(category, cached)
+        if not has_filters:
+            await store.cache_popular(category, cached)
 
     start = page * size
     end = start + size
@@ -1064,21 +1215,27 @@ async def upsert_item_from_backend(target_type: TargetType, item_id: int) -> boo
 
 
 async def remove_item_from_index(target_type: TargetType, item_id: int) -> bool:
-    """단일 아이템을 인덱스에서 즉시 제거"""
+    """단일 아이템을 인덱스에서 즉시 제거하고 Redis 스냅샷 전파"""
     idx = get_item_index()
     key = f"{target_type}:{item_id}"
     if idx.get_item_meta(key) is None:
         return False
     idx.remove_item(key)
+    new_ver = await store.save_index_snapshot(idx.to_snapshot_b64())
+    if new_ver > 0:
+        idx.set_version(new_ver)
     await clear_popular_cache()
     return True
 
 
 async def reload_artifact() -> bool:
-    """디스크에 배포된 최신 학습 아티팩트(.npz + metadata.json) 무중단 핫 리로드"""
+    """디스크에 배포된 최신 학습 아티팩트(.npz + metadata.json) 무중단 핫 리로드 및 Redis 전파"""
     idx = get_item_index()
     loaded = await asyncio.to_thread(idx.load, setting.REC_ARTIFACT_DIR)
     if loaded:
+        new_ver = await store.save_index_snapshot(idx.to_snapshot_b64())
+        if new_ver > 0:
+            idx.set_version(new_ver)
         await clear_popular_cache()
     return loaded
 
