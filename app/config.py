@@ -32,6 +32,12 @@ class Settings(BaseSettings):
 
     EXA_API_KEY: str # ai 웹 검색용
 
+    # Recommender (선택 · 백엔드 /ingest/members/** 서명 키 및 관리자 API 시크릿)
+    INGEST_MEMBER_KEY_ID: str = ""
+    INGEST_MEMBER_SECRET: str = ""
+    RECOMMENDER_ADMIN_SECRET: str = ""
+    REC_ARTIFACT_DIR: str = "/tmp/indig_recommender"
+
     #=====================================================
 
     model_config = SettingsConfigDict(
@@ -76,18 +82,36 @@ class Constants:
     LTM_LOCK_TTL_SECONDS: int = 5
     BACKEND_HTTP_TIMEOUT_SECONDS: float = 5.0
 
-    # 단기 대화 & 에이전트
-    CHAT_MAX: int = 30  # 최신 메시지 유지 갯수
+    # 단기 대화 & 에이전트 (운영 Gateway 30초 제한 고려)
+    CHAT_MAX: int = 40  # 최신 메시지 유지 갯수
     CHAT_TTL: int = 60 * 60 * 6  # TTL (초)
+    CHAT_INIT_LOCK_TTL_SECONDS: int = 5  # 첫인사 생성 분산 락 TTL (초)
     AGENT_REQUEST_LIMIT: int = 6  # 요청당 모델 최대 호출 횟수
-    TOOL_TIMEOUT_SECONDS: float = 30.0  # 도구 대기 시간 (초)
+    TOOL_TIMEOUT_SECONDS: float = 15.0  # 도구 대기 시간 (초)
     TOOL_HISTORY_MAX_CHARS: int = 300  # 히스토리 저장 시 도구 결과 최대 길이
-    LLM_TIMEOUT_MS: int = 60_000  # 모델 호출 타임아웃 (밀리초)
-    LLM_RETRY_ATTEMPTS: int = 3  # 모델 호출 시도 횟수 (최초 1회 + 재시도 2회)
+    LLM_TIMEOUT_MS: int = 25_000  # 모델 호출 타임아웃 (밀리초)
+    LLM_RETRY_ATTEMPTS: int = 2  # 모델 호출 시도 횟수 (최초 1회 + 재시도 1회)
 
     # 파일 업로드 & 멀티모달
     MAX_FILE_SIZE_BYTES: int = 20 * 1024 * 1024
     ALLOWED_GEMINI_FILE_URI_PREFIX: str = "https://generativelanguage.googleapis.com/"
+    HISTORY_ATTACHMENT_TURNS: int = 2  # 과거 히스토리 중 FileData로 재전송할 최근 유저 턴 수
+
+    # 개인화 추천 (Recommender - 옵션 B: Gemini Embedding + NumPy 서빙)
+    REC_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    REC_TEXT_EMBED_DIM: int = 768
+    REC_EMBED_DIM: int = 128
+    REC_CANDIDATE_POOL_SIZE: int = 50
+    REC_CANDIDATE_TTL: int = 60 * 10  # 후보군 캐시 TTL (10분)
+    REC_CANDIDATE_LOCK_TTL_SECONDS: int = 5  # F5 Cache Stampede 분산 락 TTL
+    REC_POPULAR_CACHE_TTL: int = 60 * 3  # 인기 목록 캐시 TTL (3분)
+    REC_QUERY_CACHE_TTL: int = 60 * 30  # 시맨틱 검색 쿼리 임베딩 캐시 TTL (30분)
+    REC_USER_TASTE_TTL: int = 60 * 60 * 24  # 유저 취향 Redis 캐시 TTL (24시간)
+    REC_WRITEBACK_INTERVAL_SECONDS: int = 60 * 15  # Write-Back DB 백업 주기 (15분)
+    REC_CATALOG_SYNC_INTERVAL_SECONDS: int = 60 * 60  # 카탈로그 자동 재동기화 주기 (1시간)
+    REC_AUTO_SYNC_ON_STARTUP: bool = True  # 기동 시 아티팩트 없으면 자동 동기화
+    REC_MAX_ARTIST_PER_PAGE: int = 2  # 화면 내 같은 아티스트 최대 노출 수 (Diversity Cap)
+    REC_MAX_STICKY_ARTIST_PER_PAGE: int = 3  # 반복 진입(Sticky) 아티스트 허용 상한
 
 
 constant = Constants()

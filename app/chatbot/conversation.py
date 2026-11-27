@@ -187,13 +187,6 @@ async def stream_conversation_events(
     except UsageLimitExceeded:
         fallback_msg = "요청을 처리하지 못했어요. 조금 더 간단하게 다시 말씀해 주시겠어요?"
         partial = "".join(accumulated_bot_text).strip()
-        saved_bot_msg = f"{partial}\n\n{fallback_msg}" if partial else fallback_msg
-        try:
-            await save_turn_history(
-                user_uuid, message_text, valid_attachments, recorded_tools, saved_bot_msg
-            )
-        except Exception as save_err:
-            logger.error(f"[Redis 에러] 제한 초과 턴 저장 실패 ({user_uuid}): {save_err}")
         yield ("text_delta", {"content": f"\n\n{fallback_msg}" if partial else fallback_msg})
         yield ("done", {"status": "limit_exceeded"})
 
@@ -211,23 +204,8 @@ async def stream_conversation_events(
         if "timeout" in err_msg or "timeout" in err_type:
             logger.error(f"[AI 시간 초과] LLM 응답 대기 시간 초과 ({user_uuid}): {e}")
             timeout_msg = "답변 생성에 시간이 너무 오래 걸려 중단되었어요. 잠시 후 다시 말씀해 주시겠어요?"
-            saved_bot_msg = f"{partial}\n\n{timeout_msg}" if partial else timeout_msg
-            try:
-                await save_turn_history(
-                    user_uuid, message_text, valid_attachments, recorded_tools, saved_bot_msg
-                )
-            except Exception as save_err:
-                logger.error(f"[Redis 에러] 타임아웃 턴 저장 실패 ({user_uuid}): {save_err}")
             yield ("text_delta", {"content": f"\n\n{timeout_msg}" if partial else timeout_msg})
             yield ("done", {"status": "timeout"})
         else:
             logger.error(f"스트리밍 처리 에러 ({user_uuid}): {e}")
-            err_fallback = "답변 생성 중 문제가 발생했습니다. 잠시 후 다시 말씀해 주시겠어요?"
-            saved_bot_msg = f"{partial}\n\n{err_fallback}" if partial else err_fallback
-            try:
-                await save_turn_history(
-                    user_uuid, message_text, valid_attachments, recorded_tools, saved_bot_msg
-                )
-            except Exception as save_err:
-                logger.error(f"[Redis 에러] 에러 턴 저장 실패 ({user_uuid}): {save_err}")
             yield ("error", {"error": "답변 생성 중 문제가 발생했습니다."})

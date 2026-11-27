@@ -49,6 +49,12 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {}
 TOOLS: dict[str, Callable[..., Any]] = {}
 
 
+def ensure_skills_loaded() -> None:
+    """단독 import 시에도 기본 스킬이 등록되도록 보장"""
+    if not TOOLS:
+        from . import skill as _skill  # noqa: F401
+
+
 def skill(status_message: str):
     """도구 등록 데코레이터"""
     def decorator(func):
@@ -60,6 +66,7 @@ def skill(status_message: str):
 
 async def execute_tool(name: str, args: dict[str, Any] | None) -> Any:
     """등록된 도구 실행"""
+    ensure_skills_loaded()
     func = TOOLS.get(name)
     if func is None:
         return {"error": f"알 수 없는 도구입니다: {name}"}
@@ -102,12 +109,13 @@ def _format_memory_for_system_prompt(memories: list[str]) -> str:
 
 async def build_system_instruction(user_uuid: str) -> str:
     """기본 지침 + 유저 장기 기억 실시간 주입"""
-    memories = await get_user_memories() if user_uuid else []
+    memories = await get_user_memories(user_uuid) if user_uuid else []
     memory_text = _format_memory_for_system_prompt(memories)
     return f"{SYSTEM_INSTRUCTION}\n{memory_text}" if memory_text else SYSTEM_INSTRUCTION
 
 
 def build_generate_config(system_instruction: str) -> types.GenerateContentConfig:
+    ensure_skills_loaded()
     return types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.2,

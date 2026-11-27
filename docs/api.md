@@ -1,23 +1,23 @@
 # INDIG 챗봇 - API 명세서
 
-> 모든 `/chat` 요청은 로그인 필수 (`AT` 쿠키 또는 `Authorization: Bearer <token>` 헤더)  
+> 모든 `/api/chatbot/**` 요청은 로그인 필수 (`AT` 쿠키 또는 `Authorization: Bearer <token>` 헤더)  
 > 비로그인 또는 토큰 만료 시 `401 Unauthorized` 반환
 
 ## 엔드포인트 요약
 
 | Method | Endpoint | 통신 방식 | 설명 |
 | :--- | :--- | :---: | :--- |
-| **`GET`** | `/chat` | REST (JSON) | 대화 기록 조회 (기록 없을 시 첫인사 자동 생성) |
-| **`POST`** | `/chat/upload` | Multipart | 파일(이미지/PDF/음원 등) Gemini 임시 업로드 (48시간 보관) |
-| **`POST`** | `/chat` | **SSE** | 사용자 질문/첨부파일 전송 및 실시간 AI 답변 스트리밍 |
+| **`GET`** | `/api/chatbot/chat` | REST (JSON) | 대화 기록 조회 (기록 없을 시 첫인사 자동 생성) |
+| **`POST`** | `/api/chatbot/chat/upload` | Multipart | 파일(이미지/PDF/음원 등) Gemini 임시 업로드 (48시간 보관) |
+| **`POST`** | `/api/chatbot/chat` | **SSE** | 사용자 질문/첨부파일 전송 및 실시간 AI 답변 스트리밍 |
 | **`GET`** | `/health/liveness` | REST (JSON) | 서버 생존 상태 확인 |
 | **`GET`** | `/health/readiness` | REST (JSON) | Redis 연결 및 서비스 준비 상태 확인 |
 
 ---
 
-## 1. GET /chat (대화 기록 조회)
+## 1. GET /api/chatbot/chat (대화 기록 조회)
 
-- 최근 20개(10턴)의 대화 기록을 반환합니다.
+- 최근 최대 40개 항목(메시지 + 도구 기록 포함, TTL 6시간) 중 사용자·봇 대화 기록을 반환합니다.
 - 대화 기록이 없으면 딘디의 첫인사를 Redis에 자동 생성 후 반환합니다.
 
 ### Response (`200 OK`)
@@ -28,7 +28,7 @@
   "has_truncated": false,
   "messages": [
     {
-      "id": "hist-bot-1",
+      "id": "msg-a1b2c3d4e5f6",
       "role": "bot",
       "text": "안녕하세요! 인디 밴드 플랫폼 **INDIG**의 AI 챗봇 **딘디**입니다.",
       "time": "오후 3:20"
@@ -39,10 +39,10 @@
 
 ---
 
-## 2. POST /chat/upload (파일 업로드)
+## 2. POST /api/chatbot/chat/upload (파일 업로드)
 
 - Google Gemini File API에 업로드되며 48시간 동안 무료 임시 보관됩니다.
-- 응답받은 객체를 그대로 `POST /chat`의 `attachments`에 넣어 전송합니다.
+- 응답받은 객체를 그대로 `POST /api/chatbot/chat`의 `attachments`에 넣어 전송합니다.
 
 ### Request (`multipart/form-data`)
 - `file`: 업로드할 파일 (최대 20MB)
@@ -62,7 +62,7 @@
 
 ---
 
-## 3. POST /chat (실시간 답변 스트리밍)
+## 3. POST /api/chatbot/chat (실시간 답변 스트리밍)
 
 - 질문 및 첨부파일을 전송하고 AI 답변을 실시간 SSE(Server-Sent Events)로 수신합니다.
 - 이전 턴에서 업로드한 파일도 멀티턴으로 기억하여 답변에 반영합니다.

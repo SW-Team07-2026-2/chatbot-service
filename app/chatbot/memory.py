@@ -26,8 +26,11 @@ def _make_lock_key(user_uuid: str) -> str:
     return f"{{{user_uuid.strip()}}}:ltm:lock"
 
 
-def _build_backend_headers(include_csrf: bool = False) -> dict[str, str]:
-    cookie_header, xsrf_token = get_current_user_auth()
+def _build_backend_headers(
+    include_csrf: bool = False,
+    auth: tuple[str, str] | None = None,
+) -> dict[str, str]:
+    cookie_header, xsrf_token = auth if auth is not None else get_current_user_auth()
     headers: dict[str, str] = {}
 
     if setting.BACKEND_HOST.strip():
@@ -122,8 +125,11 @@ async def _append_ltm_to_redis(user_uuid: str, content: str, ts: float) -> None:
         logger.warning(f"[장기 기억 Redis 반영 실패] ({user_uuid}): {e}")
 
 
-async def _fetch_from_backend(user_uuid: str) -> list[tuple[str, float]] | None:
-    headers = _build_backend_headers(include_csrf=False)
+async def _fetch_from_backend(
+    user_uuid: str,
+    auth: tuple[str, str] | None = None,
+) -> list[tuple[str, float]] | None:
+    headers = _build_backend_headers(include_csrf=False, auth=auth)
     try:
         res = await get_backend_client().get(
             constant.LTM_HISTORY_URL,
@@ -184,11 +190,15 @@ async def _read_ltm_from_redis(user_uuid: str) -> list[str] | None:
         return None
 
 
-async def add_user_memory(content: str) -> bool:
+async def add_user_memory(
+    content: str,
+    user_uuid: str | None = None,
+    auth: tuple[str, str] | None = None,
+) -> bool:
     """새 장기 기억을 백엔드 DB에 먼저 저장하고, 성공 시에만 Redis ZSET에 반영한다."""
-    user_uuid = get_current_user_uuid().strip()
+    uid = (user_uuid if user_uuid is not None else get_current_user_uuid()).strip()
     text = str(content or "").strip()
-    if not user_uuid or not text:
+    if not uid or not text:
         return False
 
     if len(text) > constant.LTM_MAX_CONTENT_LENGTH:
@@ -205,7 +215,7 @@ async def add_user_memory(content: str) -> bool:
             }
         ]
     }
-    headers = _build_backend_headers(include_csrf=True)
+    headers = _build_backend_headers(include_csrf=True, auth=auth)
 
     try:
         res = await get_backend_client().post(
@@ -215,39 +225,42 @@ async def add_user_memory(content: str) -> bool:
             timeout=constant.BACKEND_HTTP_TIMEOUT_SECONDS,
         )
     except httpx.HTTPError as e:
-        logger.error(f"[장기 기억 백엔드 저장 연결 실패] ({user_uuid}): {e}")
+        logger.error(f"[장기 기억 백엔드 저장 연결 실패] ({uid}): {e}")
         return False
 
     if res.status_code != 200:
-        logger.error(f"[장기 기억 백엔드 저장 실패] ({user_uuid}) status={res.status_code}")
+        logger.error(f"[장기 기억 백엔드 저장 실패] ({uid}) status={res.status_code}")
         return False
 
     try:
         data = res.json()
     except Exception as e:
-        logger.error(f"[장기 기억 백엔드 저장 응답 파싱 실패] ({user_uuid}): {e}")
+        logger.error(f"[장기 기억 백엔드 저장 응답 파싱 실패] ({uid}): {e}")
         return False
 
     if not isinstance(data, dict) or data.get("isSuccess") is False:
-        logger.error(f"[장기 기억 백엔드 저장 거부] ({user_uuid}): {data}")
+        logger.error(f"[장기 기억 백엔드 저장 거부] ({uid}): {data}")
         return False
 
-    await _append_ltm_to_redis(user_uuid, text, now_ts)
-    logger.info(f"[장기 기억 저장 완료] ({user_uuid}): {text}")
+    await _append_ltm_to_redis(uid, text, now_ts)
+    logger.info(f"[장기 기억 저장 완료] ({uid}): {text}")
     return True
 
 
-async def get_user_memories() -> list[str]:
+async def get_user_memories(
+    user_uuid: str | None = None,
+    auth: tuple[str, str] | None = None,
+) -> list[str]:
     """Redis 캐시를 우선 조회하고, 캐시 미스 시 백엔드에서 가져와 50개 큐(ZSET)로 적재한다."""
-    user_uuid = get_current_user_uuid().strip()
-    if not user_uuid:
+    uid = (user_uuid if user_uuid is not None else get_current_user_uuid()).strip()
+    if not uid:
         return []
 
-    cached = await _read_ltm_from_redis(user_uuid)
+    cached = await _read_ltm_from_redis(uid)
     if cached is not None:
         return cached
 
-    lock_key = _make_lock_key(user_uuid)
+    lock_key = _make_lock_key(uid)
     lock_acquired = False
     try:
         lock_acquired = bool(
@@ -261,16 +274,16 @@ async def get_user_memories() -> list[str]:
     if not lock_acquired:
         for _ in range(3):
             await asyncio.sleep(0.15)
-            cached = await _read_ltm_from_redis(user_uuid)
+            cached = await _read_ltm_from_redis(uid)
             if cached is not None:
                 return cached
 
     try:
-        items = await _fetch_from_backend(user_uuid)
+        items = await _fetch_from_backend(uid, auth=auth)
         if items is None:
             return []
 
-        await _cache_ltm_queue(user_uuid, items)
+        await _cache_ltm_queue(uid, items)
         return [_format_memory_entry(text, ts) for text, ts in items[-constant.LTM_MAX :]]
     finally:
         if lock_acquired:

@@ -8,6 +8,7 @@ from app.server import http, redis
 from app.server.api import router as server_router
 from app.chatbot import skill
 from app.chatbot.api import router as chatbot_router
+from app.recommender import router as recommender_router, service as recommender_service
 
 
 @asynccontextmanager
@@ -25,9 +26,12 @@ async def lifespan(app: FastAPI):
             f"Redis 연결 실패 ({setting.REDIS_URL})"
         )
 
+    await recommender_service.startup()
+
     yield
 
     # 서버 종료 시 백그라운드 작업 완료 대기 및 커넥션 풀 정리
+    await recommender_service.shutdown()
     await skill.drain_background_tasks()
     await http.close()
     await redis.close()
@@ -53,3 +57,4 @@ app.add_middleware(
 
 app.include_router(server_router)
 app.include_router(chatbot_router)
+app.include_router(recommender_router)
