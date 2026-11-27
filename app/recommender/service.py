@@ -326,8 +326,68 @@ def _to_recommended_item(entry: dict[str, Any]) -> RecommendedItem:
     )
 
 
+def _rebuild_taste_from_metrics(
+    idx: ItemIndex,
+    metrics: list[dict[str, Any]],
+) -> UserTasteState:
+    """백엔드 행동 기록(/ingest/members/{userId}/metrics)으로 초기 UserTasteState 재구성"""
+    state = UserTasteState(updated_at=time.time())
+    if not metrics:
+        return state
+
+    vec_sum = np.zeros(constant.REC_EMBED_DIM, dtype=np.float32)
+    vec_weight_total = 0.0
+
+    for ev in metrics:
+        if not isinstance(ev, dict):
+            continue
+        t_type = str(ev.get("targetType") or "").upper()
+        t_id = ev.get("targetId")
+        m_type = str(ev.get("metricType") or "").upper()
+        if not t_type or t_id is None or not m_type:
+            continue
+
+        item_key = f"{t_type}:{t_id}"
+        weight = METRIC_WEIGHTS.get(m_type, 1.0)
+        try:
+            m_val = float(ev.get("metricValue") or 0.0)
+        except (TypeError, ValueError):
+            m_val = 0.0
+        if m_type == "DWELL" and m_val >= 30:
+            weight = max(weight, 3.0)
+
+        rec = idx.get_item_meta(item_key)
+        item_vec = idx.get_rec_vector(item_key)
+        if item_vec is not None:
+            vec_sum += (weight / 5.0) * item_vec
+            vec_weight_total += abs(weight)
+
+        if rec is not None:
+            for aid in rec.artist_ids:
+                k = str(aid)
+                state.artist_affinity[k] = round(state.artist_affinity.get(k, 0.0) + weight, 4)
+            for g in rec.genres:
+                state.genre_affinity[g] = round(state.genre_affinity.get(g, 0.0) + weight * 0.5, 4)
+            if rec.region and weight > 0:
+                state.preferred_regions[rec.region] = round(
+                    state.preferred_regions.get(rec.region, 0.0) + 1.0, 4
+                )
+
+        if m_type in REVISIT_METRICS:
+            state.revisit_counts[item_key] = state.revisit_counts.get(item_key, 0) + 1
+        if m_type in ("BOOKING", "PURCHASE") and item_key not in state.purchased_items:
+            state.purchased_items.append(item_key)
+        if m_type == "DISLIKE" and item_key not in state.disliked_items:
+            state.disliked_items.append(item_key)
+
+    if vec_weight_total > 0 and float(np.linalg.norm(vec_sum)) > 1e-12:
+        state.vector = l2_normalize(vec_sum).tolist()
+
+    return state
+
+
 async def _load_or_init_user_taste(user_uuid: str) -> UserTasteState:
-    """Redis 우선 조회 -> 백엔드 DB 복구 -> 빈 상태 반환"""
+    """Redis 우선 조회 -> 백엔드 임베딩 복구 -> 백엔드 행동 기록(metrics) 재구성 -> 빈 상태"""
     state = await store.get_user_taste(user_uuid)
     if state is not None:
         return state
@@ -340,6 +400,12 @@ async def _load_or_init_user_taste(user_uuid: str) -> UserTasteState:
             return restored
         except Exception as e:
             logger.debug(f"[회원 벡터 복원 스킵] ({user_uuid}): {e}")
+
+    metrics = await ingest_client.fetch_member_metrics(user_uuid, limit=100)
+    if metrics:
+        rebuilt = _rebuild_taste_from_metrics(get_item_index(), metrics)
+        await store.save_user_taste(user_uuid, rebuilt, mark_dirty=True)
+        return rebuilt
 
     return UserTasteState(updated_at=time.time())
 

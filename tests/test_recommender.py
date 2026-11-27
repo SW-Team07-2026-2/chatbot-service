@@ -365,3 +365,22 @@ def test_v2_chip_filters_on_popular_and_personalized():
         assert bad.status_code == 400
 
 
+async def test_rebuild_user_taste_from_backend_metrics(monkeypatch):
+    """Redis·임베딩 백업이 모두 비었을 때 백엔드 행동 기록(metrics)으로 취향 좌표를 자동 재구성"""
+    async def no_embedding(user_id: str):
+        return None
+
+    async def fake_metrics(user_id: str, *, limit: int = 100):
+        return [
+            {"targetType": "GOODS", "targetId": 101, "metricType": "DWELL", "metricValue": 45},
+            {"targetType": "ARTIST", "targetId": 1, "metricType": "FOLLOW", "metricValue": 1},
+        ]
+
+    monkeypatch.setattr(ingest_client, "fetch_member_embedding", no_embedding)
+    monkeypatch.setattr(ingest_client, "fetch_member_metrics", fake_metrics)
+
+    page = await service.get_recommendations(category="concerts", user_uuid="u-from-metrics", size=5)
+    assert page.items[0].item_id == 201  # 한로로 행동 기록 기반으로 한로로 공연 1위 추천
+
+
+

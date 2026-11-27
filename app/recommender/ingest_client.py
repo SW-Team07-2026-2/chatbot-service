@@ -113,7 +113,18 @@ async def fetch_member_embedding(user_id: str) -> dict[str, Any] | None:
         data = res.json()
         if isinstance(data, dict) and data.get("isSuccess") is not False:
             result = data.get("result")
-            return result if isinstance(result, dict) else None
+            # 백엔드 TEXT 컬럼 직렬화 형태(dict, JSON 문자열, {"embedding": ...}) 모두 호환
+            if isinstance(result, str) and result.strip():
+                parsed = json.loads(result)
+                return parsed if isinstance(parsed, dict) else None
+            if isinstance(result, dict):
+                inner = result.get("embedding")
+                if isinstance(inner, str) and inner.strip():
+                    parsed = json.loads(inner)
+                    return parsed if isinstance(parsed, dict) else None
+                if isinstance(inner, dict):
+                    return inner
+                return result
     except (httpx.HTTPError, ValueError) as e:
         logger.warning(f"[회원 벡터 조회 오류] user={user_id}: {e}")
     return None
