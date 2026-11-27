@@ -1,7 +1,9 @@
+import asyncio
 import json
 import random
 import time
 from typing import Any
+import uuid
 
 from google.genai import types
 
@@ -21,19 +23,53 @@ def make_chat_key(user_uuid: str) -> str:
     return f"{{{user_uuid.strip()}}}:chat"
 
 
+def make_chat_init_lock_key(user_uuid: str) -> str:
+    return f"{{{user_uuid.strip()}}}:chat:init_lock"
+
+
 async def get_raw_chat_history(user_uuid: str) -> list[dict]:
-    """Redis List에서 전체 기록 조회 (기록 없으면 첫 인사 생성 후 저장)"""
+    """Redis List에서 전체 기록 조회 (기록 없으면 분산 락으로 첫 인사 1회만 생성 후 저장)"""
     try:
         r = get_client()
         key = make_chat_key(user_uuid)
         raw_items = await r.lrange(key, 0, -1)
 
         if not raw_items:
-            first_greeting = random.choice(GREETING)
-            await append_chat_message(user_uuid, "bot", first_greeting)
-            raw_items = await r.lrange(key, 0, -1)
+            lock_key = make_chat_init_lock_key(user_uuid)
+            lock_acquired = bool(
+                await r.set(
+                    lock_key,
+                    "1",
+                    nx=True,
+                    ex=constant.CHAT_INIT_LOCK_TTL_SECONDS,
+                )
+            )
+            if lock_acquired:
+                try:
+                    raw_items = await r.lrange(key, 0, -1)
+                    if not raw_items:
+                        first_greeting = random.choice(GREETING)
+                        await append_chat_message(user_uuid, "bot", first_greeting)
+                        raw_items = await r.lrange(key, 0, -1)
+                finally:
+                    try:
+                        await r.delete(lock_key)
+                    except Exception:
+                        pass
+            else:
+                for _ in range(3):
+                    await asyncio.sleep(0.1)
+                    raw_items = await r.lrange(key, 0, -1)
+                    if raw_items:
+                        break
+                if not raw_items:
+                    first_greeting = random.choice(GREETING)
+                    await append_chat_message(user_uuid, "bot", first_greeting)
+                    raw_items = await r.lrange(key, 0, -1)
 
         return [json.loads(x) for x in raw_items if x]
+    except RedisServiceUnavailable:
+        raise
     except Exception as e:
         logger.error(f"[Redis 에러] 기록 조회 실패 ({user_uuid}): {e}")
         raise RedisServiceUnavailable(f"Redis 연결 실패: {e}") from e
@@ -49,7 +85,13 @@ async def append_chat_items(user_uuid: str, items: list[dict]) -> None:
     if not items:
         return
     key = make_chat_key(user_uuid)
-    serialized = [json.dumps(item, ensure_ascii=False) for item in items]
+    normalized: list[dict] = []
+    for item in items:
+        record = dict(item)
+        if record.get("role") in ("user", "bot") and not record.get("id"):
+            record["id"] = f"msg-{uuid.uuid4().hex[:12]}"
+        normalized.append(record)
+    serialized = [json.dumps(item, ensure_ascii=False) for item in normalized]
     try:
         r = get_client()
         async with r.pipeline(transaction=True) as p:
@@ -141,7 +183,7 @@ def raw_history_to_frontend(raw_history: list[dict]) -> list[dict]:
 
         content = str(item.get("content", "")).strip()
         msg_data: dict[str, Any] = {
-            "id": f"hist-{role}-{idx}",
+            "id": str(item.get("id") or f"hist-{role}-{idx}"),
             "role": role,
             "text": content,
             "time": korea_time(item.get("ts")),
@@ -154,9 +196,21 @@ def raw_history_to_frontend(raw_history: list[dict]) -> list[dict]:
 
 
 def raw_history_to_contents(raw_history: list[dict]) -> list[types.Content]:
-    """Redis 기록 -> Gemini Content 리스트 복원 (tool 기록 및 멀티모달 파일 복원)"""
+    """Redis 기록 -> Gemini Content 리스트 복원 (tool 기록 및 최근 N턴 멀티모달 파일 복원)"""
+    user_indices = [
+        idx
+        for idx, item in enumerate(raw_history)
+        if item.get("role", "user") == "user"
+        and (str(item.get("content", "")).strip() or item.get("attachments"))
+    ]
+    recent_file_turn_indices = (
+        set(user_indices[-constant.HISTORY_ATTACHMENT_TURNS :])
+        if constant.HISTORY_ATTACHMENT_TURNS > 0
+        else set()
+    )
+
     contents: list[types.Content] = []
-    for item in raw_history:
+    for idx, item in enumerate(raw_history):
         role = item.get("role", "user")
         ts = item.get("ts", time.time())
 
@@ -172,12 +226,23 @@ def raw_history_to_contents(raw_history: list[dict]) -> list[types.Content]:
                 else f"[{format_model_time(ts)}] (첨부 파일 확인 요청)"
             )
 
-            parts: list[types.Part] = [types.Part(text=timed_content)]
-            for att in raw_attachments:
-                if isinstance(att, dict):
-                    fp = create_uploaded_file_part(att)
-                    if fp:
-                        parts.append(fp)
+            parts: list[types.Part] = []
+            if idx in recent_file_turn_indices:
+                parts.append(types.Part(text=timed_content))
+                for att in raw_attachments:
+                    if isinstance(att, dict):
+                        fp = create_uploaded_file_part(att)
+                        if fp:
+                            parts.append(fp)
+            else:
+                file_names = [
+                    str(att.get("file_name") or att.get("name") or "첨부파일").strip()
+                    for att in raw_attachments
+                    if isinstance(att, dict)
+                ]
+                if file_names:
+                    timed_content = f"{timed_content}\n[이전 첨부파일: {', '.join(file_names)}]"
+                parts.append(types.Part(text=timed_content))
 
             contents.append(types.Content(role="user", parts=parts))
 

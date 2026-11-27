@@ -1,17 +1,17 @@
 # INDIG 챗봇 - 배포 · Gateway 연결
 
-> `Dockerfile` · `.github/workflows/ci.yml` 배포 설정과 함께 `app/main.py` 에서 `/api/chatbot` 경로를 함께 제공합니다.
+> `Dockerfile` · `.github/workflows/ci.yml` 배포 설정과 함께 `app/chatbot/api.py` 에서 `/api/chatbot` 경로로 라우터를 제공합니다.
 
 ## 1. Gateway 경로
 
 운영에서는 Gateway(`https://api.indig.co.kr`)가 `/api/chatbot/**` 를 **경로 변경 없이** 챗봇으로 넘깁니다.
-`app/main.py` 에서 기존 `/chat` 라우터를 `/api/chatbot` 아래에도 열어 줍니다. 핸들러 · 인증은 기존과 같습니다.
+로컬과 운영 모두 동일한 `/api/chatbot` prefix 경로를 사용합니다.
 
 | 로컬 (`uvicorn app.main:app`) | 운영 (Gateway 경유) |
 | :--- | :--- |
-| `GET /chat` | `GET /api/chatbot/chat` |
-| `POST /chat/upload` | `POST /api/chatbot/chat/upload` |
-| `POST /chat` | `POST /api/chatbot/chat` |
+| `GET /api/chatbot/chat` | `GET /api/chatbot/chat` |
+| `POST /api/chatbot/chat/upload` | `POST /api/chatbot/chat/upload` |
+| `POST /api/chatbot/chat` | `POST /api/chatbot/chat` |
 
 Gateway 를 지날 때 지켜야 하는 것:
 
@@ -30,7 +30,7 @@ Gateway 를 지날 때 지켜야 하는 것:
 | `CORS_ORIGINS` | `https://indig.co.kr` |
 | `REDIS_URL` | `redis://redis-chatbot:6379/0` (챗봇 전용 Redis) |
 | `BACKEND_URL` | `https://api.indig.co.kr` |
-| `LLM_MODEL` | `google:gemini-flash-lite-latest` |
+| `LLM_MODEL` | `gemini-flash-lite-latest` |
 | `GEMINI_API_KEY` | Secret `app-secrets` 의 `chatbot.gemini.api-key` |
 | `EXA_API_KEY` | Secret `app-secrets` 의 `chatbot.exa.api-key` |
 
